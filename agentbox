@@ -24,6 +24,13 @@ readonly ENTRYPOINT_PATH="${SCRIPT_DIR}/entrypoint.sh"
 readonly IMAGE_NAME="agentbox:latest"
 readonly CONTAINER_PREFIX="agentbox"
 
+# Broker (credential/egress sidecar) configuration. The sidecar itself
+# (network + proxy container lifecycle) is owned by Docker Compose - see
+# broker/docker-compose.yml and start_broker()/stop_broker() below.
+readonly BROKER_DIR="${SCRIPT_DIR}/broker"
+readonly BROKER_COMPOSE_FILE="${BROKER_DIR}/docker-compose.yml"
+readonly BROKER_HOME="${HOME}/.agentbox/broker"
+
 # Colors for output
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
@@ -124,6 +131,53 @@ build_image() {
         log_error "Failed to build image"
         return 1
     fi
+}
+
+# Create the example config/secrets on first use of --broker
+broker_scaffold() {
+    mkdir -p "${BROKER_HOME}/ca"
+
+    if [[ ! -f "${BROKER_HOME}/config.yaml" ]]; then
+        cp "${BROKER_DIR}/config.example.yaml" "${BROKER_HOME}/config.yaml"
+        log_success "Created ${BROKER_HOME}/config.yaml from example - edit it to add hosts/credentials (reloads live)."
+    fi
+
+    if [[ ! -f "${BROKER_HOME}/secrets.env" ]]; then
+        cp "${BROKER_DIR}/secrets.example.env" "${BROKER_HOME}/secrets.env"
+        chmod 600 "${BROKER_HOME}/secrets.env"
+        log_success "Created ${BROKER_HOME}/secrets.env (mode 600) - add real tokens here."
+    fi
+}
+
+# Start the broker proxy sidecar and the internal network the agent joins.
+# Docker Compose owns the sidecar's image (stock mitmproxy, no build step),
+# networks, and readiness (healthcheck: CA cert written = proxy is up), so
+# there's no custom network/poll-loop bookkeeping here. Sets
+# BROKER_COMPOSE_PROJECT for stop_broker; run_container() reads
+# AGENTBOX_NETWORK_NAME to attach the agent to the same network.
+start_broker() {
+    local container_name="$1"
+
+    export AGENTBOX_BROKER_NAME="${container_name}-broker"
+    export AGENTBOX_BROKER_DIR="$BROKER_DIR"
+    export AGENTBOX_BROKER_HOME="$BROKER_HOME"
+    export AGENTBOX_NETWORK_NAME="${container_name}-net"
+
+    if ! docker compose -f "$BROKER_COMPOSE_FILE" -p "$container_name" up -d --wait --wait-timeout 30; then
+        log_error "Broker proxy failed to start. Logs: docker compose -f $BROKER_COMPOSE_FILE -p $container_name logs"
+        return 1
+    fi
+
+    BROKER_COMPOSE_PROJECT="$container_name"
+    log_success "Broker proxy started (allow/deny + credential injection active)"
+}
+
+# Torn down via `trap stop_broker EXIT` once start_broker has succeeded. Runs
+# after the agent's (blocking) docker run has already exited, so the agent
+# has detached from the network and compose can remove it cleanly.
+stop_broker() {
+    [[ -n "${BROKER_COMPOSE_PROJECT:-}" ]] && docker compose -f "$BROKER_COMPOSE_FILE" -p "$BROKER_COMPOSE_PROJECT" down &> /dev/null
+    return 0
 }
 
 expand_tilde() {
@@ -277,13 +331,18 @@ run_container() {
         mount_opts+=(-v "${HOME}/.gitconfig:/tmp/host_gitconfig:ro")
     fi
 
-    # Mount dedicated AgentBox SSH directory
-    local agentbox_ssh="${HOME}/.agentbox/ssh"
-    if [[ -d "${agentbox_ssh}" ]]; then
-        mount_opts+=(-v "${agentbox_ssh}:/home/agent/.ssh:rw")
-        log_info "AgentBox SSH directory mounted (read-write)"
+    # Mount dedicated AgentBox SSH directory (skipped in broker mode: SSH keys
+    # are sensitive material and broker mode brokers Git auth over HTTPS instead)
+    if [[ "$broker_mode" == "true" ]]; then
+        log_info "SSH directory not mounted (--broker mode). Use HTTPS + broker credentials for Git."
     else
-        log_warning "SSH not configured. Run 'agentbox ssh-init' to enable SSH operations."
+        local agentbox_ssh="${HOME}/.agentbox/ssh"
+        if [[ -d "${agentbox_ssh}" ]]; then
+            mount_opts+=(-v "${agentbox_ssh}:/home/agent/.ssh:rw")
+            log_info "AgentBox SSH directory mounted (read-write)"
+        else
+            log_warning "SSH not configured. Run 'agentbox ssh-init' to enable SSH operations."
+        fi
     fi
 
     # Mount cache directories for package managers
@@ -337,6 +396,20 @@ run_container() {
     # Set tool environment variable
     mount_opts+=(--env "TOOL=$tool")
 
+    if [[ "$broker_mode" == "true" ]]; then
+        mount_opts+=(
+            -v "${BROKER_HOME}/ca:/home/agent/.agentbox-ca:ro"
+            --env "AGENTBOX_BROKER=1"
+            --env "HTTP_PROXY=http://broker:8080"
+            --env "HTTPS_PROXY=http://broker:8080"
+            --env "http_proxy=http://broker:8080"
+            --env "https_proxy=http://broker:8080"
+            --env "NO_PROXY=localhost,127.0.0.1"
+            --env "no_proxy=localhost,127.0.0.1"
+        )
+        log_info "Egress routed through broker proxy (allow/deny + credential injection)"
+    fi
+
     # Mount host direnv approvals for translation if project has .envrc
     if [[ -f "$PROJECT_DIR/.envrc" ]]; then
         local host_direnv_allow="${HOME}/.local/share/direnv/allow"
@@ -363,6 +436,12 @@ run_container() {
             tool_cmd="claude --dangerously-skip-permissions"
         fi
 
+        if [[ "$broker_mode" == "true" ]]; then
+            local sandbox_guidance
+            sandbox_guidance="$(cat "${BROKER_DIR}/sandbox-guidance.md")"
+            tool_cmd="$tool_cmd --append-system-prompt $(printf '%q' "$sandbox_guidance")"
+        fi
+
         if [[ ${#cmd_args[@]} -gt 0 ]]; then
             # Properly escape each argument to preserve quoting
             local escaped_args=""
@@ -375,7 +454,11 @@ run_container() {
     fi
 
     local env_file_args=()
-    if [[ "$ignore_dot_env" != "true" ]]; then
+    if [[ "$broker_mode" == "true" ]]; then
+        # Secrets belong in the broker's secrets.env, not the agent container -
+        # .env files are never loaded in broker mode regardless of --ignore-dot-env.
+        log_info ".env files not loaded (--broker mode: use ${BROKER_HOME}/secrets.env instead)"
+    elif [[ "$ignore_dot_env" != "true" ]]; then
         local agentbox_env="${HOME}/.agentbox/.env"
         if [[ -f "$agentbox_env" ]]; then
             env_file_args+=(--env-file "$agentbox_env")
@@ -407,10 +490,18 @@ run_container() {
         fi
     done
 
+    # In broker mode the agent attaches only to the --internal network shared
+    # with the broker proxy - it has no route to the internet except through it.
+    local network_args=()
+    if [[ "$broker_mode" == "true" ]]; then
+        network_args+=(--network "$broker_net_name")
+    fi
+
     # Run ephemeral container with --rm
     docker run -it --rm \
         --name "$container_name" \
         --hostname "agentbox-$PROJECT_NAME" \
+        "${network_args[@]}" \
         "${port_args[@]}" \
         "${mount_opts[@]}" \
         "${env_file_args[@]}" \
@@ -435,6 +526,8 @@ Options:
     --rebuild               Force rebuild of the image
     --add-dir DIR           Mount additional directory (can be used multiple times)
     --ignore-dot-env        Do not load .env files as environment variables (still mounted)
+    --broker                Route egress through the credential/network broker sidecar.
+                             Claude only. No SSH mount, no .env files - see README.
 
 Commands:
     shell [--admin]         Start interactive shell instead of Claude CLI
@@ -457,6 +550,8 @@ Examples:
     agentbox --rebuild                  # Force rebuild image
     agentbox ssh-init                   # Set up SSH for AgentBox
     AGENTBOX_TOOL=opencode agentbox     # Use env var to select tool
+    agentbox --broker                   # Brokered network/credentials, no SSH/token mounts
+    agentbox --broker --remote-control  # Brokered + pick up the session from phone/web/IDE
 
 Containers are ephemeral and automatically removed when you exit.
 Package caches and shell history persist between sessions.
@@ -511,6 +606,8 @@ main() {
     local extra_dirs=()
     local tool="${AGENTBOX_TOOL:-claude}"
     local ignore_dot_env=false
+    local broker_mode=false
+    local broker_net_name=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -553,6 +650,10 @@ main() {
                 ignore_dot_env=true
                 shift
                 ;;
+            --broker)
+                broker_mode=true
+                shift
+                ;;
             shell)
                 shell_mode=true
                 shift
@@ -579,6 +680,11 @@ main() {
     # Validate tool selection
     if [[ "$tool" != "claude" && "$tool" != "opencode" ]]; then
         log_error "Invalid tool: $tool (must be 'claude' or 'opencode')"
+        exit 1
+    fi
+
+    if [[ "$broker_mode" == "true" && "$tool" != "claude" ]]; then
+        log_error "--broker currently supports --tool claude only"
         exit 1
     fi
 
@@ -616,6 +722,16 @@ main() {
             exit 1
         fi
 
+    fi
+
+    if [[ "$broker_mode" == "true" ]]; then
+        broker_scaffold
+        broker_net_name="${container_name}-net"
+        if ! start_broker "$container_name"; then
+            log_error "Broker startup failed, aborting."
+            exit 1
+        fi
+        trap stop_broker EXIT
     fi
 
     # Run or attach to container

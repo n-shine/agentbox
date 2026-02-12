@@ -10,6 +10,7 @@ A Docker-based development environment for running agentic coding tools in a mor
 - **Multi-Tool Support**: All agentic coding tools are supported, some built-in, others [via prompt](#adding-tools).
 - **Unified Development Environment**: Single Docker image with Python, Node.js, Java, and Shell support
 - **Isolated SSH**: Dedicated SSH directory for secure Git operations
+- **Credential & Egress Broker** (opt-in, `--broker`, Claude only): routes all outbound traffic through an allow/deny + credential-injection proxy sidecar, so SSH keys, Git/GitHub tokens, and other secrets never touch the agent container. See [Credential & Egress Broker](#credential--egress-broker---broker).
 - **Low-Maintenance Philosophy**: Always uses latest LTS tool versions, rebuilds container automatically when necessary
 
 ## Requirements
@@ -65,6 +66,12 @@ agentbox shell --admin
 
 # Set up SSH keys for AgentBox
 agentbox ssh-init
+
+# Route egress through the credential/network broker (no SSH/token mounts)
+agentbox --broker
+
+# Brokered session, pick up from your phone/browser/VS Code
+agentbox --broker --remote-control
 ```
 
 **Note**: Tool selection via `--tool` flag takes precedence over the `AGENTBOX_TOOL` environment variable.
@@ -139,6 +146,50 @@ Environment variables are loaded from `.env` files in this order (later override
 
 AgentBox includes `direnv` support - `.envrc` files are evaluated if `direnv allow`ed on the host.
 
+## Remote Control (`--remote-control`)
+
+`--remote-control` is a standard Claude Code flag, passed through like any other (see Helpful Commands above) - agentbox has no dedicated flag for it. It starts Claude Code with [Remote Control](https://code.claude.com/docs/en/remote-control) enabled, so you can pick up the running session from claude.ai/code, the Claude mobile app, or the VS Code extension. Requires `--tool claude` (the default) and a claude.ai OAuth login (API key auth is not supported by Remote Control).
+
+```bash
+agentbox --remote-control
+```
+
+**Caveat**: agentbox always runs Claude Code with `--dangerously-skip-permissions`. Combined with `--remote-control`, this means anyone with access to the session from your phone, browser, or IDE can drive unrestricted command execution in the container with no permission prompts - the remote surface has exactly the same power as your local terminal. Only use it on an account/device you trust, and be aware the session transcript is stored on Anthropic's servers while Remote Control is connected (see their [data usage policy](https://code.claude.com/docs/en/data-usage)).
+
+## Credential & Egress Broker (`--broker`)
+
+By default AgentBox mounts your SSH keys, `.gitconfig`, and `.env` tokens straight into the agent
+- all visible to a YOLO-mode agent with full Bash access. `--broker` (Claude only) puts a proxy
+sidecar between the agent and the network instead: the agent joins a Docker `--internal` network
+with no route out except through the proxy (no SSH keys or `.env` files mounted), the proxy enforces
+an allow/deny host list (a denied host gets a clear error body the agent can act on, not a hang),
+and injects real credentials into requests for hosts you've configured - the agent never holds the
+secret.
+
+```bash
+agentbox --broker
+```
+
+First run scaffolds `~/.agentbox/broker/config.yaml` (allowlist/credentials - see
+[broker/SCHEMA.md](broker/SCHEMA.md) and [broker/config.example.yaml](broker/config.example.yaml))
+and `secrets.env` (mode 600, actual token values). Edit both, then run `agentbox --broker` again.
+
+Saved changes to `config.yaml` take effect within a couple of seconds, no restart - except a value
+changed in `secrets.env` itself, which needs a restart since it's read into the proxy's environment
+once at startup (use `value_file` instead of `value_env` for live rotation).
+
+The Anthropic OAuth token (`~/.claude/.credentials.json`) is **not** brokered - it stays mounted as
+in non-broker mode. Claude Code's own Bash tool runs as the same UID as the agent, so there's no way
+to hide the tool's own credentials from itself; the only real fix is keeping the token out of the
+container and having the broker inject it instead. But the access token is short-lived and paired
+with a refresh token, so that means the broker owning Claude Code's own OAuth refresh flow, not just
+injecting a static value - not built. Everything else (Git/GitHub/GitLab tokens, cloud credentials,
+registry tokens, SSH keys) is brokered.
+
+Claude only (no `--tool opencode`), one broker per project at a time. No devcontainer integration,
+vault/1Password integration, or per-branch credential scoping - the config format is structured to
+make adding these straightforward later, but none of it is built.
+
 ## MCP Server Configuration
 
 Due to [Claude Code bug #6130](https://github.com/anthropics/claude-code/issues/6130), by default you won't be prompted to enable MCP servers when running `agentbox` directly.
@@ -175,6 +226,13 @@ Both tools use bind mounts to share authentication across all AgentBox projects:
 **OpenCode**:
 - Config: `~/.config/opencode` mounted at `/home/agent/.config/opencode`
 - Auth: `~/.local/share/opencode` mounted at `/home/agent/.local/share/opencode`
+
+### Broker State (`--broker` mode)
+
+`~/.agentbox/broker/` holds the broker's host-owned state, shared across all projects run with `--broker`:
+- `config.yaml` - allowlist/credentials config, edited live (see [Credential & Egress Broker](#credential--egress-broker---broker))
+- `secrets.env` - actual secret values (mode 600)
+- `ca/` - the proxy's MITM CA certificate, generated on first run and reused across projects
 
 ## Advanced Usage
 

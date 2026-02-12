@@ -1,0 +1,63 @@
+# AgentBox egress/credential broker config.
+#
+# Copy to ~/.agentbox/broker/config.yaml (agentbox --broker does this for
+# you on first run). This file is host-owned and mounted read-only into
+# the proxy sidecar. Edit and save it any time - the proxy polls it
+# (default: every 1s, see poll_interval) and reloads in memory. No proxy
+# or container restart needed.
+#
+# Full field reference: broker/SCHEMA.md
+
+poll_interval: 1.0
+
+deny_status: 403
+deny_message: |
+  AgentBox egress broker: host '{host}' is not in the allowlist.
+  Ask the human to add it to ~/.agentbox/broker/config.yaml (reloads live, no restart needed).
+
+# Hosts the agent may reach at all. Supports "*" globs (e.g. "*.github.io").
+# Anthropic hosts are required here for Claude Code itself to function.
+allowlist:
+  - api.anthropic.com
+  - "*.anthropic.com"       # Remote Control signaling, telemetry, statsig
+  - github.com
+  - api.github.com
+  - codeload.github.com
+  - objects.githubusercontent.com
+  - registry.npmjs.org
+  - pypi.org
+  - files.pythonhosted.org
+
+# Hosts that are tunnelled raw (never decrypted, never inspected, never
+# credential-injected). Must be a subset of allowlist. Anthropic hosts
+# live here because the agent's own OAuth token stays unbrokered - see
+# README.md "Credential & Egress Broker".
+#
+# CAUTION: passthrough hosts bypass allow/deny enforcement entirely (the
+# match happens before the request is ever inspected) - treat this list
+# as "fully trusted", not as a stricter version of the allowlist.
+tls_passthrough:
+  - api.anthropic.com
+  - "*.anthropic.com"
+
+# Per-host credential injection. The agent container sends no credential
+# (or a placeholder) for these hosts; the broker attaches the real one.
+credentials:
+  # gh CLI talks to api.github.com with a bearer token.
+  - host: api.github.com
+    inject: bearer
+    value_env: GH_BROKER_TOKEN   # read from the proxy's env / secrets.env
+
+  # git-over-https uses HTTP basic auth against github.com.
+  - host: github.com
+    inject: basic
+    username: x-access-token
+    value_env: GH_BROKER_TOKEN
+
+  # Example: npm private registry token via header, value from a file
+  # instead of an env var (value_file is re-read on every request, so it
+  # supports live secret rotation without restarting the proxy).
+  # - host: registry.npmjs.org
+  #   inject: header
+  #   name: Authorization
+  #   value_file: /run/secrets/npm_token

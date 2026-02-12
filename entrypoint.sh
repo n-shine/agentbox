@@ -30,6 +30,23 @@ if [ -d "/home/agent/.ssh" ]; then
     echo "✅ SSH directory permissions configured"
 fi
 
+if [ "$AGENTBOX_BROKER" = "1" ]; then
+    BROKER_CA_CERT="/home/agent/.agentbox-ca/mitmproxy-ca-cert.pem"
+    if [ -f "$BROKER_CA_CERT" ]; then
+        sudo cp "$BROKER_CA_CERT" /usr/local/share/ca-certificates/agentbox-broker-ca.crt
+        sudo update-ca-certificates >/dev/null 2>&1
+        # System store trust above covers curl/git/wget/apt directly. Node and
+        # Python's certifi-based tools (pip, requests) ship their own CA list
+        # and ignore the system store, so they still need explicit env vars.
+        export NODE_EXTRA_CA_CERTS="$BROKER_CA_CERT"
+        export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+        export PIP_CERT=/etc/ssl/certs/ca-certificates.crt
+        echo "✅ Broker CA trusted (system store + Node/pip env vars)"
+    else
+        echo "⚠️  AGENTBOX_BROKER=1 but broker CA cert not found at $BROKER_CA_CERT" >&2
+    fi
+fi
+
 if [ -d "/tmp/host_direnv_allow" ]; then
     mkdir -p /home/agent/.local/share/direnv/allow
     cp /tmp/host_direnv_allow/* /home/agent/.local/share/direnv/allow/ 2>/dev/null && \

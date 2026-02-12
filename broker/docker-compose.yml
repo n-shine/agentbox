@@ -1,0 +1,31 @@
+# Egress/credential broker sidecar. Owns the internal (no-egress) network the
+# agent joins and the broker container's lifecycle; the agent itself is
+# launched separately by the `agentbox` script via plain `docker run
+# --network ${AGENTBOX_NETWORK_NAME}`. Env vars are exported by
+# start_broker() in `agentbox` before invoking this file.
+services:
+  broker:
+    image: mitmproxy/mitmproxy:latest
+    container_name: ${AGENTBOX_BROKER_NAME}
+    command: ["mitmdump", "--mode", "regular", "--listen-port", "8080", "--set", "confdir=/ca", "-s", "/addon/broker_addon.py"]
+    volumes:
+      - ${AGENTBOX_BROKER_DIR}/broker_addon.py:/addon/broker_addon.py:ro
+      - ${AGENTBOX_BROKER_HOME}/config.yaml:/config/config.yaml:ro
+      - ${AGENTBOX_BROKER_HOME}/ca:/ca
+    env_file: ${AGENTBOX_BROKER_HOME}/secrets.env
+    networks:
+      internal:
+        aliases: [broker]
+      egress: {}
+    healthcheck:
+      test: ["CMD", "test", "-f", "/ca/mitmproxy-ca-cert.pem"]
+      interval: 1s
+      retries: 30
+
+networks:
+  # No route out - the agent container joins only this network.
+  internal:
+    name: ${AGENTBOX_NETWORK_NAME}
+    internal: true
+  # Normal bridge network, joined only by the broker - its route to the internet.
+  egress: {}

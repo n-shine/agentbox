@@ -23,12 +23,21 @@ AgentBox is a simplified replacement for ClaudeBox. The user was maintaining pat
 
 5. **UID/GID Handling**: Dockerfile builds with host user's UID/GID passed as build args to minimize permission issues, but some remain (see ZSH history issue).
 
+6. **Credential/Egress Broker (opt-in, `--broker`, Claude only)**: a stock `mitmproxy/mitmproxy` sidecar, addon bind-mounted (no custom image), sits between the agent and the network. Docker Compose (`broker/docker-compose.yml`) owns its lifecycle: the agent joins only a `--internal` network with no route out; the proxy is dual-homed and is the sole egress path - fail-closed for a non-root agent, no `NET_ADMIN`/iptables needed. The addon (`broker/broker_addon.py`) enforces an allow/deny host list, injects real credentials per destination host, and passes `tls_passthrough` hosts (Anthropic) through raw via mitmproxy's `tls_clienthello` hook, leaving the agent's own subscription session untouched (see point 7 for why). Config is a host-owned YAML file; every hook call opportunistically re-stats it (throttled by `poll_interval`) and swaps in a freshly parsed config on change - no restart, and a parse error keeps the last-good config rather than crashing or falling open.
+
+7. **Anthropic OAuth token stays unbrokered**: Claude Code's own Bash tool runs as the same UID as the agent, so mounting the token but hiding it from the agent isn't possible - anything Claude can read to authenticate, the agent can read too. The only way to actually keep it off the agent is to keep it out of the container and have the broker inject it at the network edge instead. That's not just credential injection, though: the OAuth access token is short-lived (`.claude/.credentials.json` holds a `refreshToken` alongside it), so the broker would have to own Claude Code's own refresh flow - mint access tokens, inject the Bearer, persist the rotated refresh token - and become the sole holder of that refresh token to avoid rotation races with any other consumer. That's real complexity for one host, so it's deliberately not built: `~/.claude` is mounted as-is and Anthropic is passed through raw (see Future Improvement below).
+
 ## Implementation Details
 
 ### File Responsibilities
 - `Dockerfile`: Multi-stage build with all language toolchains. Uses `USER agent` (UID 1000)
-- `entrypoint.sh`: Minimal - only sets PATH and creates Python venvs
-- `agentbox`: Main logic - rebuild detection, container lifecycle, mount management
+- `entrypoint.sh`: Minimal - only sets PATH and creates Python venvs. In broker mode, also trusts the proxy's CA (system store + per-tool env vars)
+- `agentbox`: Main logic - rebuild detection, container lifecycle, mount management, and (opt-in) broker sidecar lifecycle
+- `broker/docker-compose.yml`: sidecar + network lifecycle (stock mitmproxy image, addon bind-mounted, healthcheck-gated startup, `docker compose up`/`down`)
+- `broker/broker_addon.py`: mitmproxy addon - allow/deny enforcement, credential injection, live config reload, Anthropic TLS passthrough
+- `broker/config.example.yaml`, `broker/secrets.example.env`: scaffolded into `~/.agentbox/broker/` on first `--broker` run
+- `broker/SCHEMA.md`: config field reference
+- `broker/sandbox-guidance.md`: appended to Claude's system prompt in broker mode via `--append-system-prompt`, so the agent knows how to interpret a proxy denial
 
 ### Rebuild Detection
 Automatic rebuilds are triggered by:
@@ -62,6 +71,10 @@ $PROJECT_DIR            # Project directory (mounted at full host path)
 /home/agent/.local/share/opencode  # OpenCode auth
 ```
 
+In `--broker` mode, `/home/agent/.ssh` and `.env` files are not mounted/loaded at all; instead
+`/home/agent/.agentbox-ca` (the proxy's CA cert, read-only) is mounted and `HTTP(S)_PROXY` point
+at the proxy sidecar. `/home/agent/.claude` is still mounted as-is (see Architecture Decisions).
+
 ## Testing Status
 - Basic functionality verified (help command, shell mode)
 - Full Docker build/run cycle needs real environment testing
@@ -76,6 +89,8 @@ $PROJECT_DIR            # Project directory (mounted at full host path)
 4. **Debug Mode**: Add verbose logging for troubleshooting
 5. **Config File**: Support `.agentboxrc` for user preferences
 6. **WSL2 Optimizations**: Specific handling for WSL2 environments
+7. **Broker: hide the agent's own Anthropic token**: would need the broker to own the real OAuth token + refresh flow itself and become its sole holder, injecting a fresh access token at the network edge instead of the agent ever seeing one. Deliberately not built - see Architecture Decisions.
+8. **Broker: devcontainer/IDE-native integration, multi-agent (`--tool`) support in broker mode, vault/1Password-backed credentials, git-branch-scoped credentials, per-project curated images** - explicitly out of scope for the initial broker; the config schema (`broker/SCHEMA.md`) and launcher flags are structured to make adding these straightforward later.
 
 ## Known Technical Issues
 
@@ -130,4 +145,5 @@ The `agentbox` script has these key functions:
 - Core files: 3 (Dockerfile, entrypoint.sh, agentbox)
 - Documentation: 2 (README.md, DEVELOPMENT_NOTES.md)
 - Other: .gitignore, LICENSE, CLAUDE.md
+- Broker (opt-in, `--broker`): `broker/docker-compose.yml`, `broker/broker_addon.py`, `broker/config.example.yaml`, `broker/secrets.example.env`, `broker/SCHEMA.md`, `broker/sandbox-guidance.md`
 - Total: ~8 files (vs ClaudeBox's 20+)
